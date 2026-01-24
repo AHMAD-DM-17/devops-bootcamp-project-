@@ -1,76 +1,149 @@
+---
 - name: Web server (Docker + app + node_exporter)
   hosts: web
   become: true
   vars:
-    image_uri: "{{ image_uri }}"
     aws_region: "{{ aws_region | default('ap-southeast-1') }}"
+    # Pass this in CLI: -e image_uri="...:manual" (or latest)
+    image_uri: "{{ image_uri | default('') }}"
+
   tasks:
-    - name: Install base packages
+    - name: Fail early if image_uri is not provided
+      fail:
+        msg: "image_uri is required. Example: -e image_uri='ACCOUNT.dkr.ecr.REGION.amazonaws.com/devops-bootcamp/final-project-xxx:manual'"
+      when: image_uri | length == 0
+
+    - name: Install base packages (no awscli here)
       apt:
-        name: [curl, ca-certificates, awscli]
+        name:
+          - ca-certificates
+          - curl
+          - unzip
+          - jq
         state: present
         update_cache: yes
 
-    - name: Install Docker (get.docker.com)
-      shell: |
-        set -e
-        if ! command -v docker >/dev/null 2>&1; then
-          curl -fsSL https://get.docker.com | sh
-        fi
-        systemctl enable docker
-        systemctl start docker
+    # Keep get.docker.com (simple + usually works), but make it cleaner/idempotent
+    - name: Check if Docker exists
+      command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: false
 
-    - name: Login to ECR (uses instance role, not static keys)
+    - name: Install Docker (get.docker.com) if missing
       shell: |
         set -e
-        REGISTRY="$(echo "{{ image_uri }}" | cut -d/ -f1)"
-        aws ecr get-login-password --region "{{ aws_region }}" \
-          | docker login --username AWS --password-stdin "$REGISTRY"
+        curl -fsSL https://get.docker.com | sh
+      when: docker_check.rc != 0
+
+    - name: Enable and start Docker
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    # AWS CLI v2 install (fixes your "No package matching awscli" error)
+    - name: Check if AWS CLI exists
+      command: aws --version
+      register: awscli_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download AWS CLI v2 installer (zip)
+      get_url:
+        url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+        dest: /tmp/awscliv2.zip
+        mode: "0644"
+      when: awscli_check.rc != 0
+
+    - name: Unzip AWS CLI v2 installer
+      unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp
+        remote_src: yes
+      when: awscli_check.rc != 0
+
+    - name: Install AWS CLI v2
+      command: /tmp/aws/install --update
+      when: awscli_check.rc != 0
+
+    - name: Derive ECR registry from image_uri
+      set_fact:
+        ecr_registry: "{{ image_uri.split('/')[0] }}"
+
+    - name: Preflight - verify instance role can call ECR GetAuthorizationToken
+      command: aws ecr get-login-password --region "{{ aws_region }}"
+      register: ecr_pw
+      changed_when: false
+      failed_when: ecr_pw.rc != 0 or (ecr_pw.stdout | length) == 0
+
+    - name: Login to ECR (password via stdin)
+      shell: |
+        set -e
+        printf '%s' '{{ ecr_pw.stdout }}' | docker login --username AWS --password-stdin '{{ ecr_registry }}'
+      no_log: true
+      changed_when: false
 
     - name: Pull application image
-      shell: |
-        set -e
-        docker pull "{{ image_uri }}"
+      command: docker pull "{{ image_uri }}"
+      register: pull_result
+      changed_when: "'Downloaded newer image' in pull_result.stdout or 'Pull complete' in pull_result.stdout"
 
     - name: Run web app container (port 80)
       shell: |
         set -e
-        docker rm -f my-devops-project || true
+        docker rm -f my-devops-project >/dev/null 2>&1 || true
         docker run -d --restart unless-stopped \
           --name my-devops-project \
           -p 80:80 \
           "{{ image_uri }}"
+      changed_when: true
 
     - name: Run node_exporter (metrics on 9100)
       shell: |
         set -e
-        docker rm -f node_exporter || true
+        docker rm -f node_exporter >/dev/null 2>&1 || true
         docker run -d --restart unless-stopped \
           --name node_exporter \
           --net=host --pid=host \
           -v "/:/host:ro,rslave" \
           prom/node-exporter --path.rootfs=/host
+      changed_when: true
+
 
 - name: Monitoring server (Prometheus + Grafana)
   hosts: monitoring
   become: true
   vars:
     web_private_ip: "{{ web_private_ip | default('10.0.0.5') }}"
+
   tasks:
     - name: Install base packages
       apt:
-        name: [curl, ca-certificates]
+        name:
+          - ca-certificates
+          - curl
+          - unzip
         state: present
         update_cache: yes
 
-    - name: Install Docker (get.docker.com)
+    - name: Check if Docker exists
+      command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker (get.docker.com) if missing
       shell: |
         set -e
-        if ! command -v docker >/dev/null 2>&1; then
-          curl -fsSL https://get.docker.com | sh
-        fi
-        systemctl enable docker
-        systemctl start docker
+        curl -fsSL https://get.docker.com | sh
+      when: docker_check.rc != 0
+
+    - name: Enable and start Docker
+      service:
+        name: docker
+        state: started
+        enabled: true
 
     - name: Create monitoring directory
       file:
@@ -114,3 +187,4 @@
         set -e
         cd /opt/monitoring
         docker compose up -d
+      changed_when: true
