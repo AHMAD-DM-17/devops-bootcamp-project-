@@ -1,0 +1,116 @@
+- name: Web server (Docker + app + node_exporter)
+  hosts: web
+  become: true
+  vars:
+    image_uri: "{{ image_uri }}"
+    aws_region: "{{ aws_region | default('ap-southeast-1') }}"
+  tasks:
+    - name: Install base packages
+      apt:
+        name: [curl, ca-certificates, awscli]
+        state: present
+        update_cache: yes
+
+    - name: Install Docker (get.docker.com)
+      shell: |
+        set -e
+        if ! command -v docker >/dev/null 2>&1; then
+          curl -fsSL https://get.docker.com | sh
+        fi
+        systemctl enable docker
+        systemctl start docker
+
+    - name: Login to ECR (uses instance role, not static keys)
+      shell: |
+        set -e
+        REGISTRY="$(echo "{{ image_uri }}" | cut -d/ -f1)"
+        aws ecr get-login-password --region "{{ aws_region }}" \
+          | docker login --username AWS --password-stdin "$REGISTRY"
+
+    - name: Pull application image
+      shell: |
+        set -e
+        docker pull "{{ image_uri }}"
+
+    - name: Run web app container (port 80)
+      shell: |
+        set -e
+        docker rm -f my-devops-project || true
+        docker run -d --restart unless-stopped \
+          --name my-devops-project \
+          -p 80:80 \
+          "{{ image_uri }}"
+
+    - name: Run node_exporter (metrics on 9100)
+      shell: |
+        set -e
+        docker rm -f node_exporter || true
+        docker run -d --restart unless-stopped \
+          --name node_exporter \
+          --net=host --pid=host \
+          -v "/:/host:ro,rslave" \
+          prom/node-exporter --path.rootfs=/host
+
+- name: Monitoring server (Prometheus + Grafana)
+  hosts: monitoring
+  become: true
+  vars:
+    web_private_ip: "{{ web_private_ip | default('10.0.0.5') }}"
+  tasks:
+    - name: Install base packages
+      apt:
+        name: [curl, ca-certificates]
+        state: present
+        update_cache: yes
+
+    - name: Install Docker (get.docker.com)
+      shell: |
+        set -e
+        if ! command -v docker >/dev/null 2>&1; then
+          curl -fsSL https://get.docker.com | sh
+        fi
+        systemctl enable docker
+        systemctl start docker
+
+    - name: Create monitoring directory
+      file:
+        path: /opt/monitoring
+        state: directory
+        mode: "0755"
+
+    - name: Prometheus config (scrape web node_exporter)
+      copy:
+        dest: /opt/monitoring/prometheus.yml
+        mode: "0644"
+        content: |
+          global:
+            scrape_interval: 15s
+          scrape_configs:
+            - job_name: "web-node"
+              static_configs:
+                - targets: ["{{ web_private_ip }}:9100"]
+
+    - name: Docker compose for Prometheus + Grafana
+      copy:
+        dest: /opt/monitoring/docker-compose.yml
+        mode: "0644"
+        content: |
+          services:
+            prometheus:
+              image: prom/prometheus
+              volumes:
+                - /opt/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+              ports:
+                - "9090:9090"
+              restart: unless-stopped
+            grafana:
+              image: grafana/grafana
+              ports:
+                - "3000:3000"
+              restart: unless-stopped
+
+    - name: Start monitoring stack
+      shell: |
+        set -e
+        cd /opt/monitoring
+        docker compose up -d
